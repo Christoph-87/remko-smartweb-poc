@@ -66,6 +66,17 @@ CLIENT_ID_OVERRIDE = os.environ.get("REMKO_CLIENT_ID")
 DEBUG_NAME_SCAN = os.environ.get("REMKO_DEBUG_NAME_SCAN") == "1"
 READ_SUMMARY = os.environ.get("REMKO_READ_SUMMARY") == "1"
 POLL_REPEAT = int(os.environ.get("REMKO_POLL_REPEAT", "1"))
+# Set overrides (applied via /ESP after reading C0 status)
+SET_POWER = os.environ.get("REMKO_SET_POWER")  # on/off
+SET_MODE = os.environ.get("REMKO_SET_MODE")    # auto/cool/dry/heat/fan
+SETPOINT = os.environ.get("REMKO_SETPOINT")    # e.g. 21 or 21.5
+SET_FAN = os.environ.get("REMKO_SET_FAN")      # auto/low/medium/high/silent
+SET_SWING = os.environ.get("REMKO_SET_SWING")  # off/vertical/horizontal/both
+SET_ECO = os.environ.get("REMKO_SET_ECO")      # on/off
+SET_TURBO = os.environ.get("REMKO_SET_TURBO")  # on/off
+SET_SLEEP = os.environ.get("REMKO_SET_SLEEP")  # on/off
+SET_BIOCLEAN = os.environ.get("REMKO_SET_BIOCLEAN")  # on/off
+READBACK_AFTER_SET = os.environ.get("REMKO_READBACK_AFTER_SET") == "1"
 
 if not EMAIL or not PASSWORD:
     raise SystemExit("Bitte REMKO_EMAIL und REMKO_PASS als env vars setzen.")
@@ -293,6 +304,149 @@ def _build_status_cmd() -> str:
     return "".join(f"{b:02X}" for b in packet)
 
 
+def _bool_from_str(val: str | None) -> bool | None:
+    if val is None:
+        return None
+    v = val.strip().lower()
+    if v in ("1", "true", "on", "yes"):
+        return True
+    if v in ("0", "false", "off", "no"):
+        return False
+    return None
+
+
+def _build_set_cmd_from_c0(payload: list[int]) -> str | None:
+    # Build a SET (0x40) command based on current status (C0 payload).
+    # Only applies overrides if corresponding env vars are set.
+    if not payload or payload[0] != 0xC0 or len(payload) < 22:
+        return None
+
+    # Byte 1: keep existing, but ensure remoteControlMode bit set
+    b1 = payload[1] | 0x02
+
+    # Mode + Setpoint (byte 2)
+    mode_map = {"auto": 1, "cool": 2, "dry": 3, "heat": 4, "fan": 5}
+    mode = (payload[2] & 0xE0) >> 5
+    if SET_MODE:
+        mode = mode_map.get(SET_MODE.strip().lower(), mode)
+
+    sp = (payload[2] & 0x0F) + 16 + ((payload[2] & 0x10) >> 4) * 0.5
+    if SETPOINT:
+        try:
+            sp = float(SETPOINT)
+        except Exception:
+            pass
+    if sp > 60:
+        # If a Fahrenheit value is passed, convert to C
+        sp = round((sp - 32) / 1.8 * 2) / 2
+    b2 = (mode << 5) | (0x10 if sp % 1 else 0x00) | int(sp - 16)
+
+    # Fan speed (byte 3)
+    fan = payload[3] & 0x7F
+    if SET_FAN:
+        f = SET_FAN.strip().lower()
+        fan = {"silent": 20, "low": 40, "medium": 60, "high": 80, "auto": 102}.get(f, fan)
+    b3 = fan
+
+    # Timers: keep default (could reset timers)
+    b4 = 0x7F
+    b5 = 0x7F
+    b6 = 0x00
+
+    # Swing (byte 7)
+    b7 = 0x30 | (payload[7] & 0x0F)
+    if SET_SWING:
+        s = SET_SWING.strip().lower()
+        if s == "off":
+            b7 = 0x30
+        elif s == "vertical":
+            b7 = 0x30 | 0x03
+        elif s == "horizontal":
+            b7 = 0x30 | 0x0C
+        elif s == "both":
+            b7 = 0x30 | 0x0F
+
+    # Byte 8: strong/turbo, etc.
+    b8 = payload[8]
+    turbo = _bool_from_str(SET_TURBO)
+    if turbo is not None:
+        if turbo:
+            b8 |= 0x20
+        else:
+            b8 &= ~0x20
+
+    # Byte 9: eco + bioclean
+    b9 = payload[9]
+    eco = _bool_from_str(SET_ECO)
+    if eco is not None:
+        if eco:
+            b9 |= 0x80
+        else:
+            b9 &= ~0x80
+    bio = _bool_from_str(SET_BIOCLEAN)
+    if bio is not None:
+        if bio:
+            b9 |= 0x20
+        else:
+            b9 &= ~0x20
+
+    # Byte 10: sleep + turbo flag (bit1)
+    b10 = payload[10]
+    sleep = _bool_from_str(SET_SLEEP)
+    if sleep is not None:
+        if sleep:
+            b10 |= 0x01
+        else:
+            b10 &= ~0x01
+    if turbo is not None:
+        if turbo:
+            b10 |= 0x02
+        else:
+            b10 &= ~0x02
+
+    # Power on/off (byte1 bit0)
+    pwr = _bool_from_str(SET_POWER)
+    if pwr is not None:
+        if pwr:
+            b1 |= 0x01
+        else:
+            b1 &= ~0x01
+
+    cmd = [0] * 25
+    cmd[0] = 0x40
+    cmd[1] = b1
+    cmd[2] = b2
+    cmd[3] = b3
+    cmd[4] = b4
+    cmd[5] = b5
+    cmd[6] = b6
+    cmd[7] = b7
+    cmd[8] = b8
+    cmd[9] = b9
+    cmd[10] = b10
+    cmd[11] = 0x00
+    cmd[12] = 0x00
+    cmd[13] = 0x00
+    cmd[14] = 0x00
+    cmd[15] = 0x00
+    cmd[16] = 0x00
+    cmd[17] = 0x00
+    cmd[18] = 0x00
+    cmd[19] = 0x00
+    cmd[20] = 0x00
+    cmd[21] = payload[21] & 0x80  # frostProtection bit
+    cmd[22] = 0x00
+    cmd[23] = 0x00
+    cmd[24] = 0x00
+
+    cmd.append(_crc8(cmd))
+    header = [0xAA, 0x00, 0xAC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02]
+    packet = header + cmd
+    packet[1] = len(packet)
+    packet.append(_checksum(packet))
+    return "".join(f"{b:02X}" for b in packet)
+
+
 def _parse_c0_from_rx(rx_hex: str):
     data = _hex_to_bytes(rx_hex)
     if not data or len(data) < 20:
@@ -366,6 +520,18 @@ def _parse_c0_from_rx(rx_hex: str):
         "error": error,
         "unit": unit
     }
+
+
+def _c0_payload_from_rx(rx_hex: str):
+    data = _hex_to_bytes(rx_hex)
+    if not data or len(data) < 20:
+        return None
+    if data[0] != 0xAA:
+        return None
+    payload = data[10:-2]
+    if not payload or payload[0] != 0xC0:
+        return None
+    return payload
 
 
 
@@ -630,6 +796,7 @@ class Healthcheck:
         self.connected = threading.Event()
         self.connect_rc = None
         self.disconnect_rc = None
+        self.readback_pending = False
 
 
 def mqtt_healthcheck(
@@ -660,6 +827,8 @@ def mqtt_healthcheck(
         client_id = f"SMT{rnd:04d}{base}"
 
     hc = Healthcheck()
+    sent_set = {"done": False}
+    sent_readback = {"done": False}
 
     def _rc_value(rc):
         return rc.value if hasattr(rc, "value") else rc
@@ -777,6 +946,35 @@ def mqtt_healthcheck(
                                 f"error={parsed['error']}",
                             ]
                             print("Summary:", ", ".join(parts))
+                    if hc.readback_pending:
+                        # After readback arrived, clear the flag so loop can finish.
+                        hc.readback_pending = False
+                    if (not sent_set["done"]) and any([SET_POWER, SET_MODE, SETPOINT, SET_FAN, SET_SWING, SET_ECO, SET_TURBO, SET_SLEEP, SET_BIOCLEAN]):
+                        payload = _c0_payload_from_rx(rx_hex)
+                        if payload:
+                            tx_hex = _build_set_cmd_from_c0(payload)
+                            if tx_hex:
+                                client.publish(
+                                    f"{topic_base}/ESP",
+                                    json.dumps({"Tx": tx_hex, "CLIENT_ID": TX_CLIENT_ID}),
+                                    qos=2,
+                                    retain=False
+                                )
+                                sent_set["done"] = True
+                                hc.readback_pending = READBACK_AFTER_SET
+                    if hc.readback_pending and not sent_readback["done"]:
+                        # Request a fresh status after SET
+                        tx_payload = {
+                            "Tx": _build_status_cmd(),
+                            "CLIENT_ID": TX_CLIENT_ID
+                        }
+                        client.publish(
+                            f"{topic_base}/ESP",
+                            json.dumps(tx_payload),
+                            qos=2,
+                            retain=False
+                        )
+                        sent_readback["done"] = True
             except Exception:
                 pass
 
@@ -841,7 +1039,7 @@ def mqtt_healthcheck(
     t0 = time.time()
     while time.time() - t0 < timeout_sec:
         if ESP_STATUS:
-            if hc.got_rx:
+            if hc.got_rx and not hc.readback_pending:
                 break
         else:
             if hc.got_message:
