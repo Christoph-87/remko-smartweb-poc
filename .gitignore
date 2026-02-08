@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtualenv / local env
+.venv/
+.env
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
