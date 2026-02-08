@@ -30,6 +30,14 @@ export REMKO_PASS="yourPassword"
 ```
 
 ## Usage
+### Read status values (power, setpoint, room, mode, fan, swing, eco, turbo, sleep, outdoor, error)
+```bash
+REMKO_DEVICE_NAME="YOUR DEVICE NAME" \
+REMKO_ESP_STATUS=1 \
+REMKO_READ_SUMMARY=1 \
+python remko_probe.py
+```
+
 ### Turn ON (example)
 ```bash
 REMKO_DEVICE_NAME="YOUR DEVICE NAME" \
@@ -56,6 +64,8 @@ python remko_probe.py
 ## Environment variables
 - `REMKO_EMAIL`, `REMKO_PASS` — SmartWeb login
 - `REMKO_DEVICE_NAME` — exact device name from the list
+- `REMKO_ESP_STATUS=1` — send UART status request via `/ESP`
+- `REMKO_READ_SUMMARY=1` — print decoded status values
 - `REMKO_TX_HEX` — UART frame to send to `/ESP`
 - `REMKO_TX_CLIENT_ID` — defaults to `SMTACUARTTEST`
 - `REMKO_NO_RESPONSE_OK=1` — do not error if no MQTT response arrives
@@ -63,4 +73,3 @@ python remko_probe.py
 
 ## Disclaimer
 This is a proof‑of‑concept for interoperability. It is unofficial and may break if REMKO changes the backend.
-

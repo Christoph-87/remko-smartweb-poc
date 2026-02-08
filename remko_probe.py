@@ -44,6 +44,7 @@ PASSWORD = os.environ.get("REMKO_PASS")
 SMT_ID = os.environ.get("REMKO_SMT_ID")
 SMT_KEY = os.environ.get("REMKO_SMT_KEY")
 MQTT_TOPIC = os.environ.get("REMKO_MQTT_TOPIC")
+SMT_USER_OVERRIDE = os.environ.get("REMKO_SMT_USER")
 DEVICE_INDEX = os.environ.get("REMKO_DEVICE_INDEX")
 DEVICE_HINT = os.environ.get("REMKO_DEVICE_HINT")
 DEVICE_NAME = os.environ.get("REMKO_DEVICE_NAME")
@@ -54,11 +55,17 @@ VALUES_JSON = os.environ.get("REMKO_VALUES_JSON")
 VALUES_1194 = os.environ.get("REMKO_VALUES_1194")  # 64-Byte HEX-String (ID 1194 = Power)
 TX_HEX = os.environ.get("REMKO_TX_HEX")            # UART-Frame als HEX für /ESP (falls UI keinen CLIENT2HOST sendet)
 TX_CLIENT_ID = os.environ.get("REMKO_TX_CLIENT_ID") or "SMTACUARTTEST"
+ESP_STATUS = os.environ.get("REMKO_ESP_STATUS") == "1"
+ESP_REPEAT = int(os.environ.get("REMKO_ESP_REPEAT", "1"))
+SUB_ALL = os.environ.get("REMKO_SUB_ALL") == "1"
+DUMP_MQTT = os.environ.get("REMKO_DUMP_MQTT") == "1"
 ALLOW_NO_RESPONSE = os.environ.get("REMKO_NO_RESPONSE_OK") == "1"  # MQTT-Antwort optional
 TIMEOUT_SEC = int(os.environ.get("REMKO_TIMEOUT_SEC", "15"))
 CONNECT_TIMEOUT_SEC = int(os.environ.get("REMKO_CONNECT_TIMEOUT_SEC", "8"))
 CLIENT_ID_OVERRIDE = os.environ.get("REMKO_CLIENT_ID")
 DEBUG_NAME_SCAN = os.environ.get("REMKO_DEBUG_NAME_SCAN") == "1"
+READ_SUMMARY = os.environ.get("REMKO_READ_SUMMARY") == "1"
+POLL_REPEAT = int(os.environ.get("REMKO_POLL_REPEAT", "1"))
 
 if not EMAIL or not PASSWORD:
     raise SystemExit("Bitte REMKO_EMAIL und REMKO_PASS als env vars setzen.")
@@ -180,6 +187,187 @@ def _extract_from_scripts(session: requests.Session, html: str):
         for e in sorted(endpoints):
             print(" ", e)
     return values
+
+
+def _first_byte(hexstr: str | None):
+    if not hexstr or len(hexstr) < 2:
+        return None
+    try:
+        return int(hexstr[:2], 16)
+    except Exception:
+        return None
+
+
+def _extract_values_from_payload(payload: str):
+    try:
+        data = json.loads(payload)
+        if isinstance(data, dict) and "values" in data:
+            return data.get("values")
+    except Exception:
+        pass
+    # Fallback: try to locate JSON inside the payload
+    m = re.search(r"\\{.*\\}$", payload.strip(), flags=re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, dict) and "values" in data:
+                return data.get("values")
+        except Exception:
+            pass
+    return None
+
+
+def _hex_to_bytes(hexstr: str):
+    hexstr = hexstr.strip()
+    if len(hexstr) % 2 != 0:
+        return None
+    try:
+        return [int(hexstr[i:i+2], 16) for i in range(0, len(hexstr), 2)]
+    except Exception:
+        return None
+
+
+_CRC8_TABLE = [
+    0x00, 0x5E, 0xBC, 0xE2, 0x61, 0x3F, 0xDD, 0x83,
+    0xC2, 0x9C, 0x7E, 0x20, 0xA3, 0xFD, 0x1F, 0x41,
+    0x9D, 0xC3, 0x21, 0x7F, 0xFC, 0xA2, 0x40, 0x1E,
+    0x5F, 0x01, 0xE3, 0xBD, 0x3E, 0x60, 0x82, 0xDC,
+    0x23, 0x7D, 0x9F, 0xC1, 0x42, 0x1C, 0xFE, 0xA0,
+    0xE1, 0xBF, 0x5D, 0x03, 0x80, 0xDE, 0x3C, 0x62,
+    0xBE, 0xE0, 0x02, 0x5C, 0xDF, 0x81, 0x63, 0x3D,
+    0x7C, 0x22, 0xC0, 0x9E, 0x1D, 0x43, 0xA1, 0xFF,
+    0x46, 0x18, 0xFA, 0xA4, 0x27, 0x79, 0x9B, 0xC5,
+    0x84, 0xDA, 0x38, 0x66, 0xE5, 0xBB, 0x59, 0x07,
+    0xDB, 0x85, 0x67, 0x39, 0xBA, 0xE4, 0x06, 0x58,
+    0x19, 0x47, 0xA5, 0xFB, 0x78, 0x26, 0xC4, 0x9A,
+    0x65, 0x3B, 0xD9, 0x87, 0x04, 0x5A, 0xB8, 0xE6,
+    0xA7, 0xF9, 0x1B, 0x45, 0xC6, 0x98, 0x7A, 0x24,
+    0xF8, 0xA6, 0x44, 0x1A, 0x99, 0xC7, 0x25, 0x7B,
+    0x3A, 0x64, 0x86, 0xD8, 0x5B, 0x05, 0xE7, 0xB9,
+    0x8C, 0xD2, 0x30, 0x6E, 0xED, 0xB3, 0x51, 0x0F,
+    0x4E, 0x10, 0xF2, 0xAC, 0x2F, 0x71, 0x93, 0xCD,
+    0x11, 0x4F, 0xAD, 0xF3, 0x70, 0x2E, 0xCC, 0x92,
+    0xD3, 0x8D, 0x6F, 0x31, 0xB2, 0xEC, 0x0E, 0x50,
+    0xAF, 0xF1, 0x13, 0x4D, 0xCE, 0x90, 0x72, 0x2C,
+    0x6D, 0x33, 0xD1, 0x8F, 0x0C, 0x52, 0xB0, 0xEE,
+    0x32, 0x6C, 0x8E, 0xD0, 0x53, 0x0D, 0xEF, 0xB1,
+    0xF0, 0xAE, 0x4C, 0x12, 0x91, 0xCF, 0x2D, 0x73,
+    0xCA, 0x94, 0x76, 0x28, 0xAB, 0xF5, 0x17, 0x49,
+    0x08, 0x56, 0xB4, 0xEA, 0x69, 0x37, 0xD5, 0x8B,
+    0x57, 0x09, 0xEB, 0xB5, 0x36, 0x68, 0x8A, 0xD4,
+    0x95, 0xCB, 0x29, 0x77, 0xF4, 0xAA, 0x48, 0x16,
+    0xE9, 0xB7, 0x55, 0x0B, 0x88, 0xD6, 0x34, 0x6A,
+    0x2B, 0x75, 0x97, 0xC9, 0x4A, 0x14, 0xF6, 0xA8,
+    0x74, 0x2A, 0xC8, 0x96, 0x15, 0x4B, 0xA9, 0xF7,
+    0xB6, 0xE8, 0x0A, 0x54, 0xD7, 0x89, 0x6B, 0x35
+]
+
+
+def _crc8(data: list[int]) -> int:
+    crc = 0
+    for b in data:
+        crc = _CRC8_TABLE[crc ^ b]
+    return crc
+
+
+def _checksum(data: list[int]) -> int:
+    s = 0
+    for i in range(1, len(data)):
+        s += data[i]
+    return 256 - (s % 256)
+
+
+def _build_status_cmd() -> str:
+    # Payload from REMKO JS (getStatus) + header/CRC/checksum
+    cmd = [
+        0x41, 0x81, 0x00, 0xFF, 0x03, 0xFF,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x03
+    ]
+    cmd.append(_crc8(cmd))
+    header = [0xAA, 0x00, 0xAC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x03]
+    packet = header + cmd
+    packet[1] = len(packet)
+    packet.append(_checksum(packet))
+    return "".join(f"{b:02X}" for b in packet)
+
+
+def _parse_c0_from_rx(rx_hex: str):
+    data = _hex_to_bytes(rx_hex)
+    if not data or len(data) < 20:
+        return None
+    if data[0] != 0xAA:
+        return None
+    # Strip header + crc/checksum like JS: data = data.slice(10, len-2)
+    payload = data[10:-2]
+    if not payload or payload[0] != 0xC0:
+        return None
+    # See JS C0_parser for field layout.
+    pwr = (payload[1] & 0x01) > 0
+    mode_raw = (payload[2] & 0xE0) >> 5
+    setpoint = (payload[2] & 0x0F) + 16 + ((payload[2] & 0x10) >> 4) * 0.5
+    fan_raw = payload[3] & 0x7F
+    vertical = (payload[7] & 0x03) > 0
+    horizontal = (payload[7] & 0x0C) > 0
+    eco = ((payload[9] & 0x10) >> 4) > 0
+    turbo = ((payload[10] & 0x02) >> 1) > 0
+    sleep = (payload[10] & 0x01) > 0
+    indoor = (payload[11] - 50) / 2
+    outdoor = (payload[12] - 50) / 2
+    error = payload[16]
+    temp_unit_f = ((payload[10] & 0x04) >> 2) > 0
+
+    mode_map = {
+        1: "auto",
+        2: "cool",
+        3: "dry",
+        4: "heat",
+        5: "fan",
+    }
+    mode = mode_map.get(mode_raw, f"mode{mode_raw}")
+
+    if fan_raw < 21:
+        fan = "silent"
+    elif fan_raw < 41:
+        fan = "low"
+    elif fan_raw < 61:
+        fan = "medium"
+    elif fan_raw < 101:
+        fan = "high"
+    else:
+        fan = "auto"
+
+    if vertical and horizontal:
+        swing = "both"
+    elif vertical:
+        swing = "vertical"
+    elif horizontal:
+        swing = "horizontal"
+    else:
+        swing = "off"
+
+    unit = "F" if temp_unit_f else "C"
+    if temp_unit_f:
+        setpoint = round(setpoint * 1.8 + 32, 1)
+        indoor = round(indoor * 1.8 + 32, 1)
+        outdoor = round(outdoor * 1.8 + 32, 1)
+    return {
+        "power": "ON" if pwr else "OFF",
+        "setpoint": setpoint,
+        "room": indoor,
+        "mode": mode,
+        "fan": fan,
+        "swing": swing,
+        "eco": eco,
+        "turbo": turbo,
+        "sleep": sleep,
+        "outdoor": outdoor,
+        "error": error,
+        "unit": unit
+    }
+
+
 
 
 def _scan_json_for_keys(obj, needle_set):
@@ -436,6 +624,7 @@ def find_devices(session: requests.Session):
 class Healthcheck:
     def __init__(self):
         self.got_message = False
+        self.got_rx = False
         self.last_topic = None
         self.last_payload = None
         self.connected = threading.Event()
@@ -488,8 +677,11 @@ def mqtt_healthcheck(
 
         client.subscribe([
             (f"{topic_base}/HOST2CLIENT", 2),
-            (f"{topic_base}/RESP", 2)
+            (f"{topic_base}/RESP", 2),
+            (f"{topic_base}/ESP", 2),
         ])
+        if SUB_ALL:
+            client.subscribe((f"{topic_base}/#", 2))
 
         # Optional: direkter UART-Frame an den WiFi-Stick (Topic /ESP)
         if TX_HEX:
@@ -503,6 +695,20 @@ def mqtt_healthcheck(
                 qos=2,
                 retain=False
             )
+
+        if ESP_STATUS and not TX_HEX:
+            tx_payload = {
+                "Tx": _build_status_cmd(),
+                "CLIENT_ID": TX_CLIENT_ID
+            }
+            for _ in range(max(1, ESP_REPEAT)):
+                client.publish(
+                    f"{topic_base}/ESP",
+                    json.dumps(tx_payload),
+                    qos=2,
+                    retain=False
+                )
+                time.sleep(0.25)
 
         poll = {
             "FORCE_RESPONSE": True,
@@ -529,20 +735,54 @@ def mqtt_healthcheck(
         if values:
             poll["values"] = values
 
-        client.publish(
-            f"{topic_base}/CLIENT2HOST",
-            json.dumps(poll),
-            qos=2,
-            retain=False
-        )
+        for _ in range(max(1, POLL_REPEAT)):
+            client.publish(
+                f"{topic_base}/CLIENT2HOST",
+                json.dumps(poll),
+                qos=2,
+                retain=False
+            )
+            time.sleep(0.25)
 
     def on_message(client, userdata, msg):
-        hc.got_message = True
         hc.last_topic = msg.topic
         try:
             hc.last_payload = msg.payload.decode("utf-8", errors="replace")
         except Exception:
             hc.last_payload = repr(msg.payload)
+        if DUMP_MQTT:
+            print("MQTT msg:", msg.topic, (hc.last_payload or "")[:200])
+
+        if msg.topic.endswith("/ESP") or msg.topic.endswith("/RESP"):
+            try:
+                obj = json.loads(hc.last_payload)
+                rx_hex = obj.get("Rx")
+                if rx_hex:
+                    hc.got_rx = True
+                    if READ_SUMMARY:
+                        parsed = _parse_c0_from_rx(rx_hex)
+                        if parsed:
+                            unit = parsed.get("unit", "C")
+                            parts = [
+                                f"power={parsed['power']}",
+                                f"setpoint={parsed['setpoint']:.1f}{unit}",
+                                f"room={parsed['room']:.1f}{unit}",
+                                f"mode={parsed['mode']}",
+                                f"fan={parsed['fan']}",
+                                f"swing={parsed['swing']}",
+                                f"eco={int(parsed['eco'])}",
+                                f"turbo={int(parsed['turbo'])}",
+                                f"sleep={int(parsed['sleep'])}",
+                                f"outdoor={parsed['outdoor']:.1f}{unit}",
+                                f"error={parsed['error']}",
+                            ]
+                            print("Summary:", ", ".join(parts))
+            except Exception:
+                pass
+
+        # Only mark as "got message" for non-ESP topics or when Rx was received.
+        if (not msg.topic.endswith("/ESP") and not msg.topic.endswith("/RESP")) or hc.got_rx:
+            hc.got_message = True
 
     def on_subscribe(client, userdata, mid, reason_codes, properties=None):
         if reason_codes is None:
@@ -600,12 +840,22 @@ def mqtt_healthcheck(
 
     t0 = time.time()
     while time.time() - t0 < timeout_sec:
-        if hc.got_message:
-            break
+        if ESP_STATUS:
+            if hc.got_rx:
+                break
+        else:
+            if hc.got_message:
+                break
         time.sleep(0.1)
 
     client.loop_stop()
     client.disconnect()
+
+    if ESP_STATUS and not hc.got_rx:
+        if allow_no_response:
+            print("Warnung: Keine ESP-Rx empfangen (trotzdem gesendet).")
+            return
+        raise RuntimeError("ESP Status Timeout – keine Rx empfangen.")
 
     if not hc.got_message:
         if allow_no_response:
@@ -616,6 +866,27 @@ def mqtt_healthcheck(
     print("Healthcheck OK ✅")
     print("Topic:", hc.last_topic)
     print("Sample:", (hc.last_payload or "")[:300])
+
+    if READ_SUMMARY and hc.last_payload:
+        values = _extract_values_from_payload(hc.last_payload)
+        if isinstance(values, dict):
+            b1194 = _first_byte(values.get("1194"))
+            b1190 = _first_byte(values.get("1190"))
+            b5530 = _first_byte(values.get("5530"))
+
+            power = "ON" if b1194 == 0x01 else ("OFF" if b1194 == 0x02 else None)
+            setpoint = (b1190 / 2) if b1190 is not None else None
+            room = ((b5530 - 40) / 2) if b5530 is not None else None
+
+            parts = []
+            if power is not None:
+                parts.append(f"power={power}")
+            if setpoint is not None:
+                parts.append(f"setpoint={setpoint:.1f}C")
+            if room is not None:
+                parts.append(f"room={room:.1f}C")
+            if parts:
+                print("Summary:", ", ".join(parts))
 
 
 # ---------------------------------------------------------------------
@@ -643,6 +914,11 @@ def main():
         sid = d.get("sid")
         sk = d.get("sk")
         smt_user = d.get("smt_user")
+        if SMT_USER_OVERRIDE:
+            try:
+                smt_user = int(SMT_USER_OVERRIDE)
+            except Exception:
+                pass
 
         print(d.get("where"))
         if sid:
